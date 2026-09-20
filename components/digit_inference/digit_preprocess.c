@@ -20,7 +20,9 @@ typedef struct {
     uint8_t border_seed[DIGIT_PIXELS];
     uint8_t border_connected[DIGIT_PIXELS];
     uint8_t temp_mask[DIGIT_PIXELS];
+    uint8_t morph_tmp[DIGIT_PIXELS];
     int queue[DIGIT_PIXELS];
+    uint16_t labels[DIGIT_PIXELS];
     uint32_t integral[INTEGRAL_SIDE * INTEGRAL_SIDE];
 } preprocess_workspace_t;
 
@@ -254,6 +256,142 @@ static void remove_border_connected_inplace(
     }
 }
 
+/* ── Contrast stretching ─────────────────────────────────────────────── */
+
+static void contrast_stretch_u8(uint8_t *gray)
+{
+    uint8_t lo = 255;
+    uint8_t hi = 0;
+    for (int i = 0; i < DIGIT_PIXELS; ++i) {
+        if (gray[i] < lo) {
+            lo = gray[i];
+        }
+        if (gray[i] > hi) {
+            hi = gray[i];
+        }
+    }
+    if (hi <= lo) {
+        return;
+    }
+    const int range = hi - lo;
+    for (int i = 0; i < DIGIT_PIXELS; ++i) {
+        gray[i] = (uint8_t)(((int)(gray[i] - lo) * 255) / range);
+    }
+}
+
+/* ── Morphological operations (3×3 square structuring element) ───────── */
+
+static void morph_dilate_3x3(const uint8_t *in, uint8_t *out)
+{
+    memset(out, 0, DIGIT_PIXELS);
+    for (int y = 0; y < DIGIT_DIM; ++y) {
+        for (int x = 0; x < DIGIT_DIM; ++x) {
+            if (!in[idx_2d(x, y)]) {
+                continue;
+            }
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int nx = x + dx;
+                    const int ny = y + dy;
+                    if (nx >= 0 && nx < DIGIT_DIM && ny >= 0 && ny < DIGIT_DIM) {
+                        out[idx_2d(nx, ny)] = 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void morph_erode_3x3(const uint8_t *in, uint8_t *out)
+{
+    for (int y = 0; y < DIGIT_DIM; ++y) {
+        for (int x = 0; x < DIGIT_DIM; ++x) {
+            uint8_t keep = 1;
+            for (int dy = -1; dy <= 1 && keep; ++dy) {
+                for (int dx = -1; dx <= 1 && keep; ++dx) {
+                    const int nx = x + dx;
+                    const int ny = y + dy;
+                    if (nx < 0 || nx >= DIGIT_DIM || ny < 0 || ny >= DIGIT_DIM
+                        || !in[idx_2d(nx, ny)]) {
+                        keep = 0;
+                    }
+                }
+            }
+            out[idx_2d(x, y)] = keep;
+        }
+    }
+}
+
+static void morph_open(uint8_t *mask, uint8_t *tmp)
+{
+    morph_erode_3x3(mask, tmp);
+    morph_dilate_3x3(tmp, mask);
+}
+
+static void morph_close(uint8_t *mask, uint8_t *tmp)
+{
+    morph_dilate_3x3(mask, tmp);
+    morph_erode_3x3(tmp, mask);
+}
+
+/* ── Largest connected component selection ───────────────────────────── */
+
+static void keep_largest_component(uint8_t *mask, uint16_t *labels, int *queue)
+{
+    memset(labels, 0, sizeof(uint16_t) * DIGIT_PIXELS);
+    uint16_t label_id = 0;
+    uint16_t best_label = 0;
+    int best_count = 0;
+
+    for (int i = 0; i < DIGIT_PIXELS; ++i) {
+        if (!mask[i] || labels[i]) {
+            continue;
+        }
+        label_id++;
+        labels[i] = label_id;
+        int head = 0;
+        int tail = 0;
+        queue[tail++] = i;
+        int count = 1;
+
+        while (head < tail) {
+            const int cur = queue[head++];
+            const int cx = cur % DIGIT_DIM;
+            const int cy = cur / DIGIT_DIM;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    const int nx = cx + dx;
+                    const int ny = cy + dy;
+                    if (nx < 0 || nx >= DIGIT_DIM || ny < 0 || ny >= DIGIT_DIM) {
+                        continue;
+                    }
+                    const int nidx = idx_2d(nx, ny);
+                    if (mask[nidx] && !labels[nidx]) {
+                        labels[nidx] = label_id;
+                        queue[tail++] = nidx;
+                        count++;
+                    }
+                }
+            }
+        }
+
+        if (count > best_count) {
+            best_count = count;
+            best_label = label_id;
+        }
+    }
+
+    if (best_label == 0) {
+        return;
+    }
+    for (int i = 0; i < DIGIT_PIXELS; ++i) {
+        mask[i] = (labels[i] == best_label) ? 1 : 0;
+    }
+}
+
 static void fit_digit_to_canvas_28(
     const uint8_t *input,
     int box_size,
@@ -388,6 +526,9 @@ esp_err_t digit_preprocess_u8(
 
     resize_bilinear_u8(input_gray, width, height, s_ws.resized, DIGIT_DIM, DIGIT_DIM);
 
+    /* Stretch contrast so faint strokes become clearly separable. */
+    contrast_stretch_u8(s_ws.resized);
+
     bradley_roth_mask_28(
         s_ws.resized,
         window_size,
@@ -421,6 +562,14 @@ esp_err_t digit_preprocess_u8(
             memcpy(s_ws.linked, s_ws.temp_mask, DIGIT_PIXELS);
         }
     }
+
+    /* Morphological close fills small gaps in digit strokes, then open
+       removes small noise specks.  Both use the 3×3 square element. */
+    morph_close(s_ws.linked, s_ws.morph_tmp);
+    morph_open(s_ws.linked, s_ws.morph_tmp);
+
+    /* Keep only the largest connected blob — the actual digit. */
+    keep_largest_component(s_ws.linked, s_ws.labels, s_ws.queue);
 
     for (int i = 0; i < DIGIT_PIXELS; ++i) {
         const uint8_t foreground_gray = s_ws.linked[i] ? s_ws.resized[i] : 255;
